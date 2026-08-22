@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+data/
+results/
+figures/
+dataset_ranking/data/
+dataset_ranking/results/
+dataset_ranking/figures/

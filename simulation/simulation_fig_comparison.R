@@ -508,7 +508,7 @@ p2 <- ggplot(df, aes(x = AvgNegKL, y = NegRelImp)) +
     x = "Avg Neg KL",
   ) +
   annotate(
-    "text", x = -0.20, y = 0, label = "y=0.61+0.92x",
+    "text", x = -0.20, y = 0, label = "y=-0.61-0.92x",
     color = "black", size = 3.5, hjust = 0
   ) +
   annotate(
@@ -532,7 +532,7 @@ p3 <- ggplot(df, aes(x = AvgNegScoreX, y = NegRelImp)) +
     x = "Avg Neg Domain Classifier Score",
   ) +
   annotate(
-    "text", x = -0.67, y = 0, label = "y=1+0.74x",
+    "text", x = -0.67, y = 0, label = "y=-1.00-0.74x",
     color = "black", size = 3.5, hjust = 0
   ) +
   annotate(
@@ -569,4 +569,3 @@ combined <- (p + p2 + p3) +
   )
 
 print(combined)
-

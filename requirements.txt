@@ -1,7 +1,7 @@
-folktables
-joblib
-matplotlib
-numpy
-pandas
-scikit-learn
-scipy
+folktables==0.0.12
+joblib==1.4.2
+matplotlib==3.9.2
+numpy==2.1.1
+pandas==2.2.3
+scikit-learn==1.6.1
+scipy==1.15.1

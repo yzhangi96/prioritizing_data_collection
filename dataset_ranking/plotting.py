@@ -13,11 +13,11 @@ except ImportError:
     from experiment import whiten_data
 
 
-def get_sample_means_vec(X, source, target, site_column,
+def get_sample_means_vec(X, comparison, reference, site_column,
                          scaled=True, response_column=None,
                          prewhitened=True):
-    ns = np.sum(X[site_column] == source)
-    nt = np.sum(X[site_column] == target)
+    ns = np.sum(X[site_column] == comparison)
+    nt = np.sum(X[site_column] == reference)
     sigma_inv = 1 / np.sqrt((1 / ns + 1 / nt))
 
     excluded = [site_column]
@@ -39,9 +39,13 @@ def get_sample_means_vec(X, source, target, site_column,
     X_new[site_column] = X[site_column].to_numpy()
 
     value_columns = [c for c in X_new.columns if c != site_column]
-    source_means = X_new.loc[X_new[site_column] == source, value_columns].mean(axis=0)
-    target_means = X_new.loc[X_new[site_column] == target, value_columns].mean(axis=0)
-    diff = source_means - target_means
+    comparison_means = X_new.loc[
+        X_new[site_column] == comparison, value_columns
+    ].mean(axis=0)
+    reference_means = X_new.loc[
+        X_new[site_column] == reference, value_columns
+    ].mean(axis=0)
+    diff = comparison_means - reference_means
 
     if scaled:
         return sigma_inv * diff
@@ -54,17 +58,13 @@ def _qqprep(vec):
     y = x[order]
     p = (np.arange(1, len(x) + 1) - 0.5) / len(x)
     z = stats.norm.ppf(p)
-    q1, q3 = np.quantile(y, [0.25, 0.75])
-    z1, z3 = stats.norm.ppf([0.25, 0.75])
-    slope = (q3 - q1) / (z3 - z1)
-    intercept = q1 - slope * z1
     r2 = float(np.corrcoef(z, y)[0, 1] ** 2)
-    return z, y, order, slope, intercept, r2
+    return z, y, order, r2
 
 
 def get_qqplot(vec, title="", ax=None, response_column=None,
                show_title=True, show_r2=True, show_axis_labels=True):
-    z, y, order, slope, intercept, r2 = _qqprep(vec)
+    z, y, order, r2 = _qqprep(vec)
 
     if ax is None:
         fig, ax = plt.subplots()
@@ -84,7 +84,11 @@ def get_qqplot(vec, title="", ax=None, response_column=None,
         ax.scatter(z, y, s=18, color="0.1", linewidths=0, alpha=0.95)
 
     xx = np.array([z.min(), z.max()])
-    ax.plot(xx, intercept + slope * xx, color="#B23A48", linewidth=2)
+    ax.plot(xx, xx, color="#B23A48", linewidth=2)
+    x_pad = 0.08 * (z.max() - z.min())
+    y_pad = 0.08 * (y.max() - y.min())
+    ax.set_xlim(z.min() - x_pad, z.max() + x_pad)
+    ax.set_ylim(y.min() - y_pad, y.max() + y_pad)
 
     if show_title:
         ax.set_title(title, fontsize=18, pad=8, loc="left")
@@ -129,7 +133,7 @@ def plot_target_qq(qq_data, target_id, source_ids, site_column, response,
 
     for ax, source, label in zip(axes, source_ids, labels):
         vec = get_sample_means_vec(
-            qq_data, target_id, source, site_column,
+            qq_data, source, target_id, site_column,
             scaled=True, response_column=response, prewhitened=True,
         )
         get_qqplot(
@@ -156,10 +160,10 @@ def plot_qq_matrix(qq_data, ids, site_column, response,
     n = len(ids)
     fig, axes = plt.subplots(n, n, figsize=(2.6 * n, 2.6 * n),
                              facecolor="white")
-    for i, source in enumerate(ids):
-        for j, target in enumerate(ids):
+    for i, reference in enumerate(ids):
+        for j, comparison in enumerate(ids):
             ax = axes[i, j]
-            if source == target:
+            if reference == comparison:
                 ax.set_xticks([])
                 ax.set_yticks([])
                 ax.text(0.5, 0.5, labels[i], transform=ax.transAxes,
@@ -168,7 +172,7 @@ def plot_qq_matrix(qq_data, ids, site_column, response,
                     spine.set_color("0.6")
             else:
                 vec = get_sample_means_vec(
-                    qq_data, source, target, site_column,
+                    qq_data, comparison, reference, site_column,
                     scaled=True, response_column=response, prewhitened=True,
                 )
                 get_qqplot(
@@ -188,7 +192,9 @@ def plot_qq_matrix(qq_data, ids, site_column, response,
 
 
 def plot_comparison(summary, title, y_column="avg_rank", y_label=None,
-                    highlight_map=None, baseline_summary=None, path=None):
+                    highlight_map=None, baseline_summary=None, path=None,
+                    corr_y=0.95, label_offsets=None,
+                    highlight_color="green", red_highlight_map=None):
     x_columns = ["duc", "neg_kl", "neg_score_x"]
     x_labels = [
         "Avg Estimated DUC",
@@ -199,6 +205,10 @@ def plot_comparison(summary, title, y_column="avg_rank", y_label=None,
         y_label = y_column
     if baseline_summary is None:
         baseline_summary = summary
+    if summary.label.duplicated().any() or baseline_summary.label.duplicated().any():
+        raise ValueError("Plot labels must be unique.")
+    if set(summary.label) != set(baseline_summary.label):
+        raise ValueError("DUC and baseline summaries have different labels.")
 
     panel_data = [summary, baseline_summary, baseline_summary]
     y_by_label = summary.set_index("label")[y_column]
@@ -229,23 +239,67 @@ def plot_comparison(summary, title, y_column="avg_rank", y_label=None,
         else:
             highlights = highlight_map.get(x_column, set())
         highlight = df.label.isin(highlights).to_numpy()
-        ax.scatter(x[highlight], y[highlight], s=140, color="green", zorder=4)
+        ax.scatter(x[highlight], y[highlight], s=140,
+                   color=highlight_color, zorder=4)
+        red_highlights = (
+            set() if red_highlight_map is None
+            else red_highlight_map.get(x_column, set())
+        )
+        red_highlight = df.label.isin(red_highlights).to_numpy()
+        ax.scatter(x[red_highlight], y[red_highlight], s=140,
+                   color="red", zorder=5)
 
         if mask.sum() >= 3 and np.std(x[mask]) > 0 and np.std(y[mask]) > 0:
             corr_text = f"Correlation = {pearsonr(x[mask], y[mask])[0]:.2f}"
         else:
             corr_text = "Correlation = NA"
-        ax.text(0.95, 0.95, corr_text, transform=ax.transAxes,
+        ax.text(0.95, corr_y, corr_text, transform=ax.transAxes,
                 ha="right", va="top", fontsize=12, weight="bold")
 
-        dx = 0.02 * (x_range if x_range > 0 else 1)
+        y_min = np.nanmin(y[mask])
+        y_max = np.nanmax(y[mask])
+        y_range = y_max - y_min
+        norm_x = (x - x_min) / (x_range if x_range > 0 else 1)
+        norm_y = (y - y_min) / (y_range if y_range > 0 else 1)
         for i, label in enumerate(df.label):
-            color = "green" if label in highlights else "black"
-            ax.text(x[i] + dx, y[i], label, color=color, weight="semibold")
+            if label in red_highlights:
+                color = "red"
+            elif label in highlights:
+                color = highlight_color
+            else:
+                color = "black"
+            x_offset = 6
+            y_offset = 0
+            ha = "left"
+            if norm_x[i] > 0.82:
+                x_offset = -6
+                ha = "right"
+            if norm_y[i] > 0.88:
+                y_offset = -8
+            close_seen = sum(
+                abs(norm_x[i] - norm_x[j]) < 0.08
+                and abs(norm_y[i] - norm_y[j]) < 0.08
+                for j in range(i)
+            )
+            if close_seen:
+                y_offset += 10 * close_seen
+            if label_offsets is not None:
+                offset = label_offsets.get(x_column, {}).get(label)
+                if offset is not None:
+                    x_offset, y_offset = offset
+                    ha = "right" if x_offset < 0 else "left"
+            ax.annotate(
+                label, xy=(x[i], y[i]), xytext=(x_offset, y_offset),
+                textcoords="offset points", color=color, weight="semibold",
+                ha=ha, va="center",
+            )
 
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
         ax.set_xlabel(x_label, fontsize=16)
-        ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        if x_column == "duc":
+            ax.xaxis.set_major_formatter(FormatStrFormatter("%.3f"))
+        else:
+            ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.tick_params(axis="both", labelsize=14)
         ax.grid(False)
         for spine in ax.spines.values():

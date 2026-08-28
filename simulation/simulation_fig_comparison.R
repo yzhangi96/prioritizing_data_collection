@@ -1,16 +1,13 @@
 ## Import libraries
 library(calinf) # for simulating random shift. See https://arxiv.org/abs/2202.11886
-library(comprehenr) # for list comprehension
-library(ggplot2) 
-library(dplyr)
-library(parallel)
-library(caret)       
-library(stats)      
-library(ks)        
-library(arrow)
-library(patchwork)
-library(MASS)       
+script_arg <- grep("^--file=", commandArgs(trailingOnly=FALSE), value=TRUE)
+script_dir <- if (length(script_arg)) {
+  dirname(normalizePath(sub("^--file=", "", script_arg[[1]])))
+} else {
+  getwd()
+}
 EPS <- 1e-6
+TEST_SEED_OFFSET <- 1000000L
 
 get_P1 <- function(n, seed, d=15){
   #' Get samples from target distribution P1
@@ -279,7 +276,28 @@ fit_density <- function(X, seed, bandwidths = 10^seq(-1, 1, length.out = 10)) {
 }
   
 
-compute_kl_and_score <- function(P1_train, P2_train, Pk_train, seed) {
+score_x_python <- NULL
+
+compute_score_x <- function(P1_train, P2_train, Pk_train, seed) {
+  if (is.null(score_x_python)) {
+    python <- Sys.getenv("RETICULATE_PYTHON", unset=Sys.which("python"))
+    if (python == "") python <- Sys.which("python3")
+    reticulate::use_python(python, required=TRUE)
+    score_x_python <<- reticulate::import_from_path(
+      "simulation_score_x", path = script_dir
+    )
+  }
+  p <- ncol(P1_train)
+  reference <- rbind(P1_train[, 2:p], P2_train[, 2:p])
+  source <- Pk_train[, 2:p]
+  as.numeric(score_x_python$compute_score_x(
+    reference, source, random_state = as.integer(seed)
+  ))
+}
+
+
+compute_kl_and_score <- function(P1_train, P2_train, Pk_train, seed,
+                                 score_seed=seed) {
   #' Compute KL divergence and score fn between densities estimated from
   #' (X1, X2) and Xk after PCA projection
   #' @param P1_train Subset of samples from target distribution P1
@@ -306,18 +324,15 @@ compute_kl_and_score <- function(P1_train, P2_train, Pk_train, seed) {
   # KL(t||s)
   kl <- sum(t * log(t / s))
   
-  log_t <- log(predict(kde_t, x = X1X2_pca) + EPS)
-  log_s <- log(predict(kde_s, x = X1X2_pca) + EPS)
-  
-  log_ratio <- log_t - log_s
-  score_x <- mean(log_ratio) / sd(log_ratio)
+  score_x <- compute_score_x(P1_train, P2_train, Pk_train, score_seed)
   
   return(list("kl" = kl, "score_x" = score_x))
 }
 
 
-run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores, trial,
-                           compute_kl=FALSE){
+run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores,
+                           seed_start=1,
+                           compute_kl=FALSE, save_samples=FALSE){
   #' Run an experiment across multiple trials in parallel
   #'
   #' @param deltas Numeric vector: shift strength for sources, .. 
@@ -325,9 +340,9 @@ run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores, trial,
   #' @param n_test Number of test samples from P1
   #' @param trials Number of trials to run
   #' @param num_cores Number of cores for parallel processing
-  #' @param trial Use as random seed for reproducibility
+  #' @param seed_start First trial seed
   #' @param compute_kl Whether to compute KL and score_x in R (default FALSE).
-  #' If False, stores samples as parquets 
+  #' @param save_samples Whether to store generated samples as parquet files
   #'
   #' @return A list containing mse_df for different source distributions
   
@@ -337,7 +352,7 @@ run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores, trial,
 
     # P1
     P1_train <- get_P1(n1_train, seed = trial_id)
-    P1_test <- get_P1(n_test, seed = trial_id)
+    P1_test <- get_P1(n_test, seed = TEST_SEED_OFFSET + trial_id)
     
     # Sample data
     source_list <- sample_data(deltas, nk_vec, seed = trial_id)
@@ -348,32 +363,32 @@ run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores, trial,
       )
 
     # Weights and ducs (~0.05 secs)
-    weights_and_ducs <- to_list(for (s in 2:length(deltas)) 
+    weights_and_ducs <- lapply(2:length(deltas), function(s)
         calc_weights_and_duc(
           P1_train, source_list[[1]], source_list[[s]][1:nk_vec[s],], case=3)
         )
 
     if(compute_kl){
       # Calculate KL and score
-      kl_score_x <- to_list(for (s in 2:length(deltas))
+      kl_score_x <- lapply(2:length(deltas), function(s)
         compute_kl_and_score(
-          P1_train, source_list[[1]], source_list[[s]][1:nk_vec[s],], seed=trial_id)
+          P1_train, source_list[[1]], source_list[[s]][1:nk_vec[s],],
+          seed=trial_id, score_seed=trial_id+s-1)
       )
-      kl_x <- to_vec(for (s in kl_score_x) s$kl)
-      score_x <- to_vec(for (s in kl_score_x) s$score_x)
+      kl_x <- vapply(kl_score_x, `[[`, numeric(1), "kl")
+      score_x <- vapply(kl_score_x, `[[`, numeric(1), "score_x")
     } else{
       kl_x <- NA
       score_x <- NA
-      # Save datasets inside "data" folder
-      write_parquet(P1_train, file.path("data", paste0("P1_train_trial", trial_id, ".parquet")))
-      write_parquet(P1_test,  file.path("data", paste0("P1_test_trial",  trial_id, ".parquet")))
-      
-      # Save each source in source_list
-      for (i in seq_along(source_list)) {
-        write_parquet(
-          source_list[[i]],
-          file.path("data", paste0("source_", i, "_trial", trial_id, ".parquet"))
-        )
+      if(save_samples){
+        arrow::write_parquet(P1_train, file.path("data", paste0("P1_train_trial", trial_id, ".parquet")))
+        arrow::write_parquet(P1_test, file.path("data", paste0("P1_test_trial", trial_id, ".parquet")))
+        for (i in seq_along(source_list)) {
+          arrow::write_parquet(
+            source_list[[i]],
+            file.path("data", paste0("source_", i, "_trial", trial_id, ".parquet"))
+          )
+        }
       }
     }
     
@@ -382,22 +397,24 @@ run_experiment <- function(deltas, nk_vec, n_test, trials, num_cores, trial,
                         1, case=1) 
     mse_P1P2 <- calc_mse(P1_test, P1_train, source_list[[1]], source_list[[2]], 
                          weights_and_ducs_P1P2$weights, case=2) 
-    all_mse <- to_vec(for (s in 2:length(deltas)) 
+    all_mse <- vapply(2:length(deltas), function(s)
         calc_mse(P1_test, P1_train, source_list[[1]], source_list[[s]][1:nk_vec[s],], 
-                 weights_and_ducs[[s-1]]$weights, case=3)
+                 weights_and_ducs[[s-1]]$weights, case=3), numeric(1)
         )
     
-    list("mse" = c(mse_P1, mse_P1P2, all_mse), 
+    list("seed" = trial_id,
+         "mse" = c(mse_P1, mse_P1P2, all_mse), 
          "weights_P2" = weights_and_ducs_P1P2$weights, 
-         "weights_Pk" = to_list(for (s in weights_and_ducs) s$weights),
-         "ducs" = to_vec(for (s in weights_and_ducs) s$duc),
+         "weights_Pk" = lapply(weights_and_ducs, `[[`, "weights"),
+         "ducs" = vapply(weights_and_ducs, `[[`, numeric(1), "duc"),
          "kl_x" = kl_x, "score_x" = score_x
          )
   }
   
   # Run trials in parallel (reproducible with set.seed)
+  trial_ids <- seq.int(seed_start, length.out=trials)
   results <- parallel::mclapply(
-    1:trials, single_run, mc.cores = num_cores
+    trial_ids, single_run, mc.cores = num_cores
   )
   return(results)
 }
@@ -437,135 +454,38 @@ num_cores <- 4
 # ########
 # 
 
-results <- readRDS("results_simulation_comparison.RDS")
-# Avg mse and ducs across trials
-all_mse <- lapply(results, `[[`, "mse")
-avg_mse <- Reduce("+", all_mse) / length(all_mse)
-all_ducs <- lapply(results, `[[`, "ducs")
-avg_ducs <- Reduce("+", all_ducs) / length(all_ducs)
-avg_rel_imp <- 1-avg_mse[3:length(avg_mse)]/avg_mse[2]
+if (Sys.getenv("SIMULATION_DEFINITIONS_ONLY") != "1") {
+  simulation_payload <- readRDS(file.path(script_dir, "results_simulation_comparison.RDS"))
+  results <- if (is.null(simulation_payload$results)) simulation_payload else simulation_payload$results
+  # Avg mse and ducs across trials
+  all_mse <- lapply(results, `[[`, "mse")
+  avg_mse <- Reduce("+", all_mse) / length(all_mse)
+  all_ducs <- lapply(results, `[[`, "ducs")
+  avg_ducs <- Reduce("+", all_ducs) / length(all_ducs)
+  avg_rel_imp <- 1-avg_mse[3:length(avg_mse)]/avg_mse[2]
 
-# Avg weights
-all_w2 <- lapply(results, `[[`, "weights_P2")
-avg_w2 <- Reduce("+", all_w2) / length(all_w2)
-all_wk <- lapply(results, `[[`, "weights_Pk")
-avg_wk <- lapply(seq_along(all_wk[[1]]), function(k) {
-  mats <- lapply(all_wk, `[[`, k)
-  Reduce("+", mats) / length(mats)
-})
+  # Avg weights
+  all_w2 <- lapply(results, `[[`, "weights_P2")
+  avg_w2 <- Reduce("+", all_w2) / length(all_w2)
+  all_wk <- lapply(results, `[[`, "weights_Pk")
+  avg_wk <- lapply(seq_along(all_wk[[1]]), function(k) {
+    mats <- lapply(all_wk, `[[`, k)
+    Reduce("+", mats) / length(mats)
+  })
 
-########
-# Plotting
-
-## Read in simulation results from python notebook
-
-avg_results_kl_score <- read.csv("kl_score_x_avg.csv")
-df<- data.frame(
-  AvgDUC = avg_ducs,
-  NegRelImp = -1*avg_rel_imp,
-  AvgNegKL = -1*avg_results_kl_score$kl,
-  AvgNegScoreX = -1*avg_results_kl_score$score_x
-)
-
-## Calculate corr and linear fit for plots
-coefs_kl <- coef(lm(avg_rel_imp ~ df$AvgNegKL))
-corr_kl <- cor(df$NegRelImp, df$AvgNegKL)
-corr_duc <- cor(df$NegRelImp, df$AvgDUC)
-coefs_score <- coef(lm(avg_rel_imp ~ df$AvgNegScoreX))
-corr_score <- cor(df$NegRelImp, df$AvgNegScoreX)
-
-
-p <- ggplot(df, aes(x = AvgDUC, y = NegRelImp)) +
-  geom_point(size = 3, color = "black") +
-  geom_abline(slope = -1, intercept = 0, linetype = "dashed", color = "gray40") +
-  labs(
-    x = "Avg Estimated DUC",
-    y = "Avg Neg Relative Excess MSE "
-  ) +
-  annotate(
-    "text", x = 0.72, y = 0, label = "y = -x",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  annotate(
-    "text", x = 0.72, y = -0.1, label = "Corr = -0.99",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
-  scale_y_continuous(limits = c(-1, 0), breaks = seq(-1, 0, by = 0.1)) +
-  theme_minimal(base_size = 16) +
-  theme(
-    panel.grid = element_blank(),
-    axis.line = element_line(color = "black"),
-    plot.background = element_rect(fill = "white", color = NA),
-    panel.background = element_rect(fill = "white", color = NA),
-    axis.title.y = element_text(size = 12)  
-  ) 
-
-p2 <- ggplot(df, aes(x = AvgNegKL, y = NegRelImp)) +
-  geom_point(size = 3, color = "black") +
-  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "gray40") +
-  labs(
-    x = "Avg Neg KL",
-  ) +
-  annotate(
-    "text", x = -0.20, y = 0, label = "y=-0.61-0.92x",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  annotate(
-    "text", x = -0.20, y = -0.1, label = "Corr = -0.76",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  scale_y_continuous(limits = c(-1, 0), breaks = seq(-1, 0, by = 0.1)) +
-  theme_minimal(base_size = 16) +
-  theme(
-    panel.grid = element_blank(),
-    axis.line = element_line(color = "black"),
-    plot.background = element_rect(fill = "white", color = NA),
-    panel.background = element_rect(fill = "white", color = NA)
+  avg_results_kl_score <- read.csv(file.path(script_dir, "kl_score_x_avg.csv"))
+  simulation_plot_data <- data.frame(
+    candidate = 1:(length(deltas) - 1),
+    delta = deltas[-1],
+    n_k = nk_vec[-1],
+    AvgDUC = avg_ducs,
+    NegRelImp = -1*avg_rel_imp,
+    AvgNegKL = -1*avg_results_kl_score$kl,
+    AvgNegScoreX = -1*avg_results_kl_score$score_x
   )
-
-
-p3 <- ggplot(df, aes(x = AvgNegScoreX, y = NegRelImp)) +
-  geom_point(size = 3, color = "black") +
-  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "gray40") +
-  labs(
-    x = "Avg Neg Domain Classifier Score",
-  ) +
-  annotate(
-    "text", x = -0.67, y = 0, label = "y=-1.00-0.74x",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  annotate(
-    "text", x = -0.67, y = -0.1, label = "Corr = -0.90",
-    color = "black", size = 3.5, hjust = 0
-  ) +
-  scale_y_continuous(limits = c(-1, 0), breaks = seq(-1, 0, by = 0.1)) +
-  theme_minimal(base_size = 16) +
-  theme(
-    panel.grid = element_blank(),
-    axis.line = element_line(color = "black"),
-    plot.background = element_rect(fill = "white", color = NA),
-    panel.background = element_rect(fill = "white", color = NA)
+  write.csv(
+    simulation_plot_data,
+    file.path(script_dir, "simulation_plot_data.csv"),
+    row.names=FALSE
   )
-
-p2 <- p2 +
-  theme(
-    axis.title.y = element_blank(),
-  )
-
-p3 <- p3 +
-  theme(
-    axis.title.y = element_blank(),
-  )
-
-combined <- (p + p2 + p3) +
-  plot_layout(ncol = 3) +
-  plot_annotation(
-    title = "Predicting model performance without outcome data"
-  ) &
-  theme(
-    plot.title = element_text(hjust = 0.5) ,
-    axis.title.x = element_text(size = 12)  ,
-  )
-
-print(combined)
+}

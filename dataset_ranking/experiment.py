@@ -1,6 +1,8 @@
 import argparse
 import hashlib
 import importlib.metadata
+import inspect
+import json
 import os
 import pickle
 import platform
@@ -15,6 +17,7 @@ from scipy import linalg, stats
 from scipy.stats import pearsonr, rankdata
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.neighbors import KernelDensity
 from sklearn.pipeline import make_pipeline
@@ -55,8 +58,21 @@ ACS_COLUMNS = [
 ]
 NHANES_DATASET = "nhanes_cholesterol"
 NHANES_YEAR_ORDER = [1999, 2011, 2015, 2001, 2009, 2017, 2013, 2003, 2005, 2007]
-NHANES_DEFAULT_SOURCES = ["sex0", "sex1", "race0", "race2", "age2", "age4"]
+NHANES_DEFAULT_SOURCES = [
+    "race2_age3", "recent_2y_race0", "recent_2y_sex1",
+    "recent_3y_race0", "recent_4y", "recent_4y_age4",
+]
 NHANES_DEFAULT_TARGET = "late_race1"
+NHANES_TEMPORAL_SOURCES = [
+    "early_2y", "early_3y", "early_4y",
+    "year_1999", "year_2001", "year_2015",
+]
+NHANES_TEMPORAL_TARGET = "y2017"
+NHANES_ARTHRITIS_SOURCES = [
+    "all_pre", "no_arthritis", "no_diabetes", "no_hypertension",
+    "recent_3y_arthritis", "recent_3y_no_arthritis",
+]
+NHANES_ARTHRITIS_TARGET = "late_no_arthritis"
 
 
 def create_acs_pickle(data_dir=DATA_DIR):
@@ -165,6 +181,27 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def config_sha256(config):
+    def json_default(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        return str(value)
+
+    encoded = json.dumps(
+        config, sort_keys=True, separators=(",", ":"),
+        default=json_default,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def procedure_sha256(config):
+    procedure = {
+        key: value for key, value in config.items()
+        if key not in ["seed_start", "trials"]
+    }
+    return config_sha256(procedure)
+
+
 def dataframe_sha256(X):
     digest = hashlib.sha256()
     schema = "\n".join(
@@ -271,11 +308,33 @@ def get_nhanes_cuts(X, cutoff=2017):
     for age in range(5):
         cuts[f"age{age}"] = pre & (X.RIDAGEYR == age)
         cuts[f"recent_age{age}"] = cuts["recent"] & (X.RIDAGEYR == age)
+
+    recent_2y = X.nhanes_year.isin(years[-2:])
+    recent_3y = X.nhanes_year.isin(years[-3:])
+    recent_4y = X.nhanes_year.isin(years[-4:])
+    cuts.update({
+        "all_pre": pre,
+        **{f"year_{year}": X.nhanes_year == year for year in years},
+        "early_2y": X.nhanes_year.isin(years[:2]),
+        "early_3y": X.nhanes_year.isin(years[:3]),
+        "early_4y": X.nhanes_year.isin(years[:4]),
+        "no_arthritis": pre & (X.MCQ160A_20 == 1),
+        "no_diabetes": pre & (X.DIQ010_20 == 1),
+        "no_hypertension": pre & (X.BPQ020_20 == 1),
+        "recent_3y_arthritis": recent_3y & (X.MCQ160A_10 == 1),
+        "recent_3y_no_arthritis": recent_3y & (X.MCQ160A_20 == 1),
+        "race2_age3": pre & (X.RIDRETH_merged == 2) & (X.RIDAGEYR == 3),
+        "recent_2y_race0": recent_2y & (X.RIDRETH_merged == 0),
+        "recent_2y_sex1": recent_2y & (X.RIAGENDR == 1),
+        "recent_3y_race0": recent_3y & (X.RIDRETH_merged == 0),
+        "recent_4y": recent_4y,
+        "recent_4y_age4": recent_4y & (X.RIDAGEYR == 4),
+    })
     return cuts
 
 
 def get_nhanes_target_mask(X, target_name):
-    if target_name == "2017":
+    if target_name in {"2017", "y2017"}:
         return X.nhanes_year == 2017, 2017
 
     target_mask = X.nhanes_year.isin([2015, 2017])
@@ -286,6 +345,8 @@ def get_nhanes_target_mask(X, target_name):
         target_mask &= X.RIDRETH_merged == int(target_name[-1])
     elif target_name.startswith("late_age"):
         target_mask &= X.RIDAGEYR == int(target_name[-1])
+    elif target_name == "late_no_arthritis":
+        target_mask &= X.MCQ160A_20 == 1
     elif target_name != "late":
         raise ValueError(f"Unknown NHANES target: {target_name}")
     return target_mask, cutoff
@@ -510,6 +571,45 @@ def get_weight(y_reg, x_source):
     return weight, duc
 
 
+def compute_score_x(target, source):
+    train_n = len(target)
+    source_train = source.iloc[:train_n]
+    source_validation = source.iloc[train_n:]
+    if not len(source_validation):
+        raise ValueError("Score X requires held-out source rows.")
+
+    classifier = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=10000, tol=0.1),
+    )
+    classifier.fit(
+        pd.concat([source_train, target]),
+        np.concatenate([np.ones(train_n), np.zeros(train_n)]),
+    )
+    return classifier.predict_proba(source_validation)[:, 1].mean()
+
+
+def score_x_definition():
+    return {
+        "name": "Score X",
+        "features": "covariates_only",
+        "source_class": 1,
+        "target_class": 0,
+        "training": "equal target and source sample sizes",
+        "evaluation": "mean source-class probability on held-out source rows",
+        "preprocessing": "StandardScaler",
+        "classifier": "LogisticRegression",
+        "max_iter": 10000,
+        "tolerance": 0.1,
+        "upstream_repository": "the-chen-lab/data-addition-dilemma",
+        "upstream_commit": "279777ff5ab8757b5da7430a788bf10b08014522",
+        "upstream_function": "kl_utils.py:compute_score",
+        "implementation_sha256": hashlib.sha256(
+            inspect.getsource(compute_score_x).encode()
+        ).hexdigest(),
+    }
+
+
 def compute_baseline_scores(target, source, seed):
     pipeline = make_pipeline(
         StandardScaler(),
@@ -544,9 +644,8 @@ def compute_baseline_scores(target, source, seed):
         target_density / target_density.sum(),
         source_density / source_density.sum(),
     )
-    log_ratio = np.log(target_density) - np.log(source_density)
-    kde_log_ratio = np.mean(log_ratio) / np.std(log_ratio)
-    return kl, kde_log_ratio
+
+    return kl, compute_score_x(target, source)
 
 
 def _run_acs_trial(data, seed, n_test=1000, n_t=30, n_k=1000,
@@ -620,7 +719,7 @@ def _run_acs_trial(data, seed, n_test=1000, n_t=30, n_k=1000,
             - Xbar_target_duc
         )
         duc_weight, usefulness = get_weight(y_reg_duc, x_source_duc)
-        score_kl, score_kde = compute_baseline_scores(
+        score_kl, score_classifier = compute_baseline_scores(
             samples_t[features], samples_s[features], seed
         )
 
@@ -628,7 +727,7 @@ def _run_acs_trial(data, seed, n_test=1000, n_t=30, n_k=1000,
         duc_weights.append(duc_weight)
         duc.append(usefulness)
         kl.append(score_kl)
-        score_x.append(score_kde)
+        score_x.append(score_classifier)
         source_hashes.append(index_hash(samples_s.index))
 
     fit_target = RandomForestRegressor(random_state=np_rng, n_jobs=1).fit(
@@ -745,7 +844,7 @@ def _run_seeded_trial(data, seed, n_test=1000, n_t=30, n_k=1000,
         )
         duc_weight, usefulness = get_weight(y_reg_duc, x_source_duc)
 
-        score_kl, score_kde = compute_baseline_scores(
+        score_kl, score_classifier = compute_baseline_scores(
             samples_t[features], samples_s[features], source_seed
         )
 
@@ -769,7 +868,7 @@ def _run_seeded_trial(data, seed, n_test=1000, n_t=30, n_k=1000,
         duc_weights.append(duc_weight)
         duc.append(usefulness)
         kl.append(score_kl)
-        score_x.append(score_kde)
+        score_x.append(score_classifier)
         source_hashes.append(index_hash(samples_s.index))
         pool_mse.append(np.mean((samples_test[response] - y_pool) ** 2))
         weighted_mse.append(np.mean((samples_test[response] - y_weighted) ** 2))
@@ -819,9 +918,15 @@ def experiment_config(data, seed_start, trials, n_test, n_t, n_k,
         "target_id": data["target_id"],
         "source_ids": list(data["source_ids"]),
         "labels": list(data["labels"]),
+        "source_names": list(data.get("source_names", [])),
+        "target_name": data.get("target_name"),
         "response": data["response"],
         "model_columns": list(data.get("model_columns", [])),
         "whitening": data.get("whitening"),
+        "prediction_data": "standardized",
+        "baseline_data": "standardized",
+        "duc_data": "standardized_then_whitened",
+        "score_x": score_x_definition(),
         "seed_start": seed_start,
         "trials": trials,
         "n_test": n_test,
@@ -842,12 +947,15 @@ def run_trials(data, trials=1000, seed_start=123, jobs=1,
     config = experiment_config(
         data, seed_start, trials, n_test, n_t, n_k, n_target_mean
     )
+    run_config_sha256 = procedure_sha256(config)
 
     def run_seed(seed):
-        return run_trial(
+        result = run_trial(
             data, seed, n_test=n_test, n_t=n_t, n_k=n_k,
             n_target_mean=n_target_mean,
         )
+        result["run_config_sha256"] = run_config_sha256
+        return result
 
     results = []
     if checkpoint_path is not None:
@@ -863,6 +971,11 @@ def run_trials(data, trials=1000, seed_start=123, jobs=1,
                 raise ValueError("Checkpoint seeds do not match this run.")
             if len(results) != len(completed_seeds):
                 raise ValueError("Checkpoint results are incomplete.")
+            if any(
+                result.get("run_config_sha256") != run_config_sha256
+                for result in results
+            ):
+                raise ValueError("Checkpoint trial provenance does not match this run.")
 
     for start in range(len(results), len(seeds), checkpoint_every):
         batch_seeds = seeds[start:start + checkpoint_every]
@@ -942,7 +1055,7 @@ def summarize_results(results, labels):
     })
 
 
-def save_results(data, results, output_dir):
+def save_results(data, results, output_dir, run_config=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -950,11 +1063,33 @@ def save_results(data, results, output_dir):
     trials = data.get("trials", len(results))
     seed_start = data.get("seed_start")
     seeds = None if seed_start is None else list(range(seed_start, seed_start + trials))
+    expected_config = experiment_config(
+        data, seed_start, trials, data.get("n_test"), data.get("n_t"),
+        data.get("n_k"), data.get("n_target_mean"),
+    )
+    if run_config is None:
+        run_config = expected_config
+    else:
+        fields = [
+            "code_sha256", "dataset", "data_sha256", "raw_data_sha256",
+            "target_id", "source_ids", "labels", "source_names", "target_name",
+            "response", "model_columns", "whitening", "prediction_data",
+            "baseline_data", "duc_data", "score_x", "seed_start", "trials",
+            "n_test", "n_t", "n_k", "n_target_mean",
+        ]
+        if any(run_config.get(key) != expected_config.get(key) for key in fields):
+            raise ValueError("Run configuration does not match the current experiment.")
+
+    run_hash = procedure_sha256(run_config)
+    if any(result.get("run_config_sha256") != run_hash for result in results):
+        raise ValueError(
+            "Trial provenance does not match the result-file configuration."
+        )
+    if seeds is not None and [result.get("seed") for result in results] != seeds:
+        raise ValueError("Trial seeds do not match the result-file configuration.")
+
     payload = {
-        "config": experiment_config(
-            data, seed_start, trials, data.get("n_test"), data.get("n_t"),
-            data.get("n_k"), data.get("n_target_mean"),
-        ),
+        "config": run_config,
         "dataset": data["name"],
         "labels": data["labels"],
         "target_id": data["target_id"],
@@ -962,14 +1097,15 @@ def save_results(data, results, output_dir):
         "site_column": data["site_column"],
         "response": data["response"],
         "whitening_error": data["whitening_error"],
-        "prediction_data": "standardized",
-        "baseline_data": "standardized",
-        "duc_data": "whitened",
-        "code_sha256": file_sha256(__file__),
+        "prediction_data": run_config["prediction_data"],
+        "baseline_data": run_config["baseline_data"],
+        "duc_data": run_config["duc_data"],
+        "score_x_definition": run_config["score_x"],
+        "code_sha256": run_config["code_sha256"],
         "data_sha256": data.get("data_sha256"),
         "raw_data_sha256": data.get("raw_data_sha256"),
         "data_file_sha256": data.get("data_file_sha256"),
-        "environment": environment_versions(),
+        "environment": run_config["environment"],
         "whitening": data.get("whitening"),
         "trials": trials,
         "seed_start": seed_start,
@@ -1004,6 +1140,8 @@ def run_dataset(name, data_dir, output_dir, args):
         )
     else:
         raise ValueError(name)
+    if args.result_name is not None:
+        data["name"] = args.result_name
 
     data.update({
         "trials": args.trials,
@@ -1048,6 +1186,7 @@ def main():
     parser.add_argument("--acs-target-state", type=int, default=6)
     parser.add_argument("--nhanes-sources", nargs="+", default=None)
     parser.add_argument("--nhanes-target", default=None)
+    parser.add_argument("--result-name", default=None)
     args = parser.parse_args()
 
     if args.dataset in ["acs", "all"]:

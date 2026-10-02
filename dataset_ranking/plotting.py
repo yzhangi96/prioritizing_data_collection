@@ -8,9 +8,9 @@ from scipy import stats
 from scipy.stats import pearsonr
 
 try:
-    from .experiment import whiten_data
+    from .experiment_equal_source_sizes import whiten_data
 except ImportError:
-    from experiment import whiten_data
+    from experiment_equal_source_sizes import whiten_data
 
 
 def get_sample_means_vec(X, comparison, reference, site_column,
@@ -194,12 +194,13 @@ def plot_qq_matrix(qq_data, ids, site_column, response,
 def plot_comparison(summary, title, y_column="avg_rank", y_label=None,
                     highlight_map=None, baseline_summary=None, path=None,
                     corr_y=0.95, label_offsets=None,
-                    highlight_color="green", red_highlight_map=None):
+                    highlight_color="green", red_highlight_map=None,
+                    x_label_prefix="Avg Estimated"):
     x_columns = ["duc", "neg_kl", "neg_score_x"]
     x_labels = [
-        "Avg Estimated DUC",
-        "Avg Estimated Negative KL",
-        "Avg Estimated Negative Domain Classifier Score",
+        f"{x_label_prefix} DUC",
+        f"{x_label_prefix} Negative KL",
+        f"{x_label_prefix} Negative Domain Classifier Score",
     ]
     if y_label is None:
         y_label = y_column

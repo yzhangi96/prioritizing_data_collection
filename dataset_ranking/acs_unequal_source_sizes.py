@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, rankdata
 from sklearn.ensemble import RandomForestRegressor
 
 from dataset_ranking.experiment_equal_source_sizes import (
@@ -32,6 +32,7 @@ SOURCE_SIZE_BY_STATE = {
 
 DATA = None
 SOURCE_SIZES = None
+N_TARGET_MEAN = None
 
 
 def run_trial(seed):
@@ -53,10 +54,26 @@ def run_trial(seed):
     samples_t = target_train.sample(n=30, random_state=np_rng)
     samples_t_duc = target_duc.loc[samples_t.index]
 
+    target_model_cov = DATA["target_model_cov"]
+    target_cov = DATA["target_cov"]
+    target_mean_index = None
+    if N_TARGET_MEAN is not None:
+        target_mean_pool = target_train.drop(samples_t.index)
+        target_mean_index = py_rng.sample(
+            target_mean_pool.index.tolist(), N_TARGET_MEAN
+        )
+        target_model_cov = (
+            target.loc[target_mean_index, features].mean(axis=0).to_numpy()
+        )
+        target_cov = (
+            target_duc.loc[target_mean_index, duc_features]
+            .mean(axis=0).to_numpy()
+        )
+
     xbar_t = samples_t[features].mean(axis=0).to_numpy()
-    y_reg = DATA["target_model_cov"] - xbar_t
+    y_reg = target_model_cov - xbar_t
     xbar_t_duc = samples_t_duc[duc_features].mean(axis=0).to_numpy()
-    y_reg_duc = DATA["target_cov"] - xbar_t_duc
+    y_reg_duc = target_cov - xbar_t_duc
 
     samples_sources = [
         source.sample(n=size, random_state=np_rng)
@@ -124,13 +141,17 @@ def run_trial(seed):
         "seed": seed,
         "test_index_hash": index_hash(samples_test.index),
         "target_index_hash": index_hash(samples_t.index),
+        "target_mean_index_hash": (
+            None if target_mean_index is None else index_hash(target_mean_index)
+        ),
         "source_index_hashes": source_hashes,
     }
 
 
-def unequal_size_config(data, source_sizes, trials, seed_start):
+def unequal_size_config(data, source_sizes, trials, seed_start,
+                        n_target_mean=None):
     config = experiment_config(
-        data, seed_start, trials, 1000, 30, None, None
+        data, seed_start, trials, 1000, 30, None, n_target_mean
     )
     config["unequal_source_size_code_sha256"] = file_sha256(__file__)
     config["source_sizes"] = list(source_sizes)
@@ -138,15 +159,19 @@ def unequal_size_config(data, source_sizes, trials, seed_start):
 
 
 def run_trials(data, source_sizes, trials=1000, seed_start=123, jobs=1,
-               checkpoint_path=None, checkpoint_every=4):
+               n_target_mean=None, checkpoint_path=None,
+               checkpoint_every=4):
     if checkpoint_every < 1:
         raise ValueError("checkpoint_every must be positive.")
 
-    global DATA, SOURCE_SIZES
+    global DATA, SOURCE_SIZES, N_TARGET_MEAN
     DATA = data
     SOURCE_SIZES = list(source_sizes)
+    N_TARGET_MEAN = n_target_mean
     seeds = list(range(seed_start, seed_start + trials))
-    config = unequal_size_config(data, source_sizes, trials, seed_start)
+    config = unequal_size_config(
+        data, source_sizes, trials, seed_start, n_target_mean
+    )
     run_hash = procedure_sha256(config)
 
     results = []
@@ -195,6 +220,29 @@ def run_trials(data, source_sizes, trials=1000, seed_start=123, jobs=1,
     return results, config
 
 
+def summarize_unequal_results(results, labels):
+    weighted_mse = np.asarray([
+        result["weighted_mse_list"] for result in results
+    ])
+    ranks = np.asarray([
+        rankdata(row, method="average") for row in weighted_mse
+    ])
+    return pd.DataFrame({
+        "label": labels,
+        "weighted_mse": weighted_mse.mean(axis=0),
+        "avg_rank": ranks.mean(axis=0),
+        "duc": np.asarray([
+            result["duc_list"] for result in results
+        ]).mean(axis=0),
+        "neg_kl": -np.asarray([
+            result["kl_list"] for result in results
+        ]).mean(axis=0),
+        "neg_score_x": -np.asarray([
+            result["score_x_list"] for result in results
+        ]).mean(axis=0),
+    })
+
+
 def save_results(data, source_sizes, results, config, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -212,6 +260,7 @@ def save_results(data, source_sizes, results, config, output_dir):
         "source_sizes": list(source_sizes),
         "trials": len(results),
         "seed_start": config["seed_start"],
+        "seeds": [result["seed"] for result in results],
         "results": results,
         "summary": summary,
         "correlations": correlations,
@@ -228,11 +277,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=DATA_DIR)
     parser.add_argument(
-        "--output-dir", default=RESULT_DIR / "acs_unequal_source_sizes"
+        "--output-dir", default=RESULT_DIR
     )
     parser.add_argument("--trials", type=int, default=1000)
     parser.add_argument("--seed-start", type=int, default=123)
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--n-target-mean", type=int)
     parser.add_argument("--checkpoint-every", type=int, default=4)
     args = parser.parse_args()
 
@@ -249,7 +299,8 @@ def main():
         trials=args.trials,
         seed_start=args.seed_start,
         jobs=args.jobs,
-        checkpoint_path=output_dir / "checkpoint.pkl",
+        n_target_mean=args.n_target_mean,
+        checkpoint_path=output_dir / "acs_unequal_source_sizes_checkpoint.pkl",
         checkpoint_every=args.checkpoint_every,
     )
     summary, correlations = save_results(

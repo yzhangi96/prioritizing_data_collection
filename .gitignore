@@ -5,6 +5,10 @@ __pycache__/
 
 data/
 results/
+!results/
+results/*
+!results/acs_unequal_source_sizes_results.pkl
+!results/acs_unequal_source_sizes_summary.csv
 figures/
 dataset_ranking/data/
 dataset_ranking/results/
